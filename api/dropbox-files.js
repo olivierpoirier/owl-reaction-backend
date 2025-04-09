@@ -20,7 +20,14 @@ export default async function handler(req, res) {
         body: JSON.stringify({ path: folderPath })
       })
   
-      const data = await response.json()
+      const text = await response.text()
+      let data
+      try {
+        data = JSON.parse(text)
+      } catch (e) {
+        console.error("❌ JSON invalide (list_folder) :", text)
+        return res.status(500).json({ error: "Réponse Dropbox invalide (list_folder)" })
+      }
   
       if (data.error) {
         console.error("❌ Dropbox list_folder error:", data.error)
@@ -31,34 +38,42 @@ export default async function handler(req, res) {
   
       for (const file of data.entries) {
         if (file.name.endsWith('.mp3') || file.name.endsWith('.wav')) {
-          const shareRes = await fetch('https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings', {
+          const createRes = await fetch('https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings', {
             method: 'POST',
             headers: {
               'Authorization': `Bearer ${token}`,
               'Content-Type': 'application/json'
             },
-            body: JSON.stringify({
-              path: file.path_lower,
-              settings: {
-                requested_visibility: 'public'
-              }
-            })
+            body: JSON.stringify({ path: file.path_lower })
           })
   
-          const shareData = await shareRes.json()
-  
-          let rawUrl = null
-          if (shareData && shareData.url) {
-            rawUrl = shareData.url.replace("?dl=0", "?raw=1")
-          } else {
-            console.warn(`⚠️ Impossible de générer un lien public pour ${file.name}`)
+          const createText = await createRes.text()
+          let createData
+          try {
+            createData = JSON.parse(createText)
+          } catch (e) {
+            console.error(`❌ JSON invalide (create_shared_link) :`, createText)
             continue
           }
   
-          audioFiles.push({
-            name: file.name,
-            url: rawUrl
-          })
+          // Gérer le cas où le lien existe déjà
+          if (createData?.url) {
+            const rawUrl = createData.url.replace("?dl=0", "?raw=1")
+            audioFiles.push({
+              name: file.name,
+              url: rawUrl
+            })
+          } else if (createData?.error?.['.tag'] === 'shared_link_already_exists') {
+            const existing = createData.error.shared_link_already_exists.metadata
+            const rawUrl = existing.url.replace("?dl=0", "?raw=1")
+            audioFiles.push({
+              name: file.name,
+              url: rawUrl
+            })
+          } else {
+            console.warn(`⚠️ Aucun lien public disponible pour ${file.name}`, createData)
+            continue
+          }
         }
       }
   
@@ -68,4 +83,3 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Erreur Dropbox" })
     }
   }
-  

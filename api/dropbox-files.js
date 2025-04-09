@@ -1,6 +1,16 @@
 export default async function handler(req, res) {
+    // 🛡️ Autorisation CORS
+    res.setHeader("Access-Control-Allow-Origin", "*")
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type")
+  
+    // 🚪 Réponse aux requêtes préflight
+    if (req.method === "OPTIONS") {
+      return res.status(200).end()
+    }
+  
     const token = process.env.DROPBOX_TOKEN
-    const folderPath = '/owlbear' // ou '/audios'
+    const folderPath = '/owlbear' // ton dossier de sons
   
     try {
       const response = await fetch('https://api.dropboxapi.com/2/files/list_folder', {

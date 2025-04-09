@@ -1,16 +1,14 @@
 export default async function handler(req, res) {
-    // 🛡️ Autorisation CORS
     res.setHeader("Access-Control-Allow-Origin", "*")
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     res.setHeader("Access-Control-Allow-Headers", "Content-Type")
   
-    // 🚪 Réponse aux requêtes préflight
     if (req.method === "OPTIONS") {
       return res.status(200).end()
     }
   
     const token = process.env.DROPBOX_TOKEN
-    const folderPath = '/owlbear' // ton dossier de sons
+    const folderPath = '/owlbear'
   
     try {
       const response = await fetch('https://api.dropboxapi.com/2/files/list_folder', {
@@ -22,31 +20,52 @@ export default async function handler(req, res) {
         body: JSON.stringify({ path: folderPath })
       })
   
-      const text = await response.text()
+      const data = await response.json()
   
-      try {
-        const data = JSON.parse(text)
-  
-        if (data.error) {
-          console.error("❌ Réponse Dropbox contient une erreur :", data.error)
-          return res.status(500).json({ error: data.error })
-        }
-  
-        const audioFiles = data.entries
-          .filter(f => f.name.endsWith('.mp3') || f.name.endsWith('.wav'))
-          .map(f => ({
-            name: f.name,
-            path: f.path_lower
-          }))
-  
-        return res.status(200).json(audioFiles)
-      } catch (err) {
-        console.error("❌ Impossible de parser JSON :", text)
-        return res.status(500).json({ error: 'Réponse Dropbox invalide' })
+      if (data.error) {
+        console.error("❌ Dropbox list_folder error:", data.error)
+        return res.status(500).json({ error: data.error })
       }
+  
+      const audioFiles = []
+  
+      for (const file of data.entries) {
+        if (file.name.endsWith('.mp3') || file.name.endsWith('.wav')) {
+          const shareRes = await fetch('https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              path: file.path_lower,
+              settings: {
+                requested_visibility: 'public'
+              }
+            })
+          })
+  
+          const shareData = await shareRes.json()
+  
+          let rawUrl = null
+          if (shareData && shareData.url) {
+            rawUrl = shareData.url.replace("?dl=0", "?raw=1")
+          } else {
+            console.warn(`⚠️ Impossible de générer un lien public pour ${file.name}`)
+            continue
+          }
+  
+          audioFiles.push({
+            name: file.name,
+            url: rawUrl
+          })
+        }
+      }
+  
+      return res.status(200).json(audioFiles)
     } catch (err) {
-      console.error("❌ Erreur de requête Dropbox :", err)
-      res.status(500).json({ error: 'Erreur Dropbox' })
+      console.error("❌ Dropbox error:", err)
+      return res.status(500).json({ error: "Erreur Dropbox" })
     }
   }
   

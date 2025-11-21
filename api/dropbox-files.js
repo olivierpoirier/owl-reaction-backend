@@ -5,7 +5,7 @@ dotenv.config();
 const DROPBOX_API = "https://api.dropboxapi.com";
 const DROPBOX_TOKEN_URL = `${DROPBOX_API}/oauth2/token`;
 const DROPBOX_LIST_FOLDER = `${DROPBOX_API}/2/files/list_folder`;
-const DROPBOX_CREATE_LINK = `${DROPBOX_API}/2/sharing/create_shared_link_with_settings`;
+const DROPBOX_GET_TEMP_LINK = `${DROPBOX_API}/2/files/get_temporary_link`;
 const DROPBOX_LIST_FOLDER_CONTINUE = `${DROPBOX_API}/2/files/list_folder/continue`;
 
 async function getAccessToken() {
@@ -63,9 +63,9 @@ async function listFolderAll(token, path) {
   return entries;
 }
 
-async function createSharedLinkForPath(token, path_lower) {
+async function getTemporaryLink(token, path_lower) {
   try {
-    const res = await fetch(DROPBOX_CREATE_LINK, {
+    const res = await fetch(DROPBOX_GET_TEMP_LINK, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -74,42 +74,20 @@ async function createSharedLinkForPath(token, path_lower) {
       body: JSON.stringify({ path: path_lower }),
     });
     const data = await res.json();
-
-    if (data.url) return data.url;
-    // if shared link already exists Dropbox returns error with metadata in nested object
-    if (data.error && data.error[".tag"] === "shared_link_already_exists" && data.error.shared_link_already_exists?.metadata?.url) {
-      return data.error.shared_link_already_exists.metadata.url;
+    // data.link is the temporary direct link to file contents
+    if (data && data.link) return data.link;
+    if (data && data.error) {
+      console.warn("get_temporary_link returned error:", data.error);
     }
-    console.warn("No shared link data for", path_lower, data);
     return null;
   } catch (e) {
-    console.error("createSharedLinkForPath error:", e);
+    console.error("getTemporaryLink error:", e);
     return null;
   }
 }
 
 function isAudioFile(name) {
   return /\.(mp3|wav|ogg|m4a|flac)$/i.test(name);
-}
-
-/**
- * Quick transform for Dropbox share links -> direct raw file host
- * - remove query string
- * - replace www.dropbox.com with dl.dropboxusercontent.com
- *
- * Note: this works for most shared links. If you have special /scl/fi/... links that don't map,
- * consider the proxy approach described earlier.
- */
-function toDropboxDirect(link) {
-  if (!link) return null;
-  try {
-    const base = link.split("?")[0];
-    // replace host for direct file delivery
-    return base.replace("www.dropbox.com", "dl.dropboxusercontent.com");
-  } catch (e) {
-    console.warn("toDropboxDirect failed for", link, e);
-    return link;
-  }
 }
 
 export default async function handler(req, res) {
@@ -136,16 +114,14 @@ export default async function handler(req, res) {
           };
         }
         if (entry[".tag"] === "file") {
-          if (!isAudioFile(entry.name)) {
-            return null;
-          }
-          const link = await createSharedLinkForPath(token, entry.path_lower);
-          const url = link ? toDropboxDirect(link) : null;
+          if (!isAudioFile(entry.name)) return null;
+          // use get_temporary_link for files (more reliable than shared links for direct access)
+          const tempLink = await getTemporaryLink(token, entry.path_lower);
           return {
             type: "file",
             name: entry.name,
             path_lower: entry.path_lower,
-            url,
+            url: tempLink, // may be null on error
           };
         }
         return null;

@@ -1,12 +1,12 @@
-// dropbox-files.js (Node / Vercel / Next API handler style)
+// dropbox-files.js
 import dotenv from "dotenv";
 dotenv.config();
 
 const DROPBOX_API = "https://api.dropboxapi.com";
 const DROPBOX_TOKEN_URL = `${DROPBOX_API}/oauth2/token`;
 const DROPBOX_LIST_FOLDER = `${DROPBOX_API}/2/files/list_folder`;
-const DROPBOX_CREATE_LINK = `${DROPBOX_API}/2/sharing/create_shared_link_with_settings`;
 const DROPBOX_LIST_FOLDER_CONTINUE = `${DROPBOX_API}/2/files/list_folder/continue`;
+const DROPBOX_CREATE_LINK = `${DROPBOX_API}/2/sharing/create_shared_link_with_settings`;
 
 async function getAccessToken() {
   const credentials = Buffer.from(`${process.env.DROPBOX_APP_KEY}:${process.env.DROPBOX_APP_SECRET}`).toString("base64");
@@ -23,12 +23,10 @@ async function getAccessToken() {
   });
 
   const data = await response.json();
-
   if (!data.access_token) {
     console.error("❌ Impossible d'obtenir un access_token :", data);
-    throw new Error("Échec lors de l’obtention de l'access_token Dropbox");
+    throw new Error("Échec obtention access_token Dropbox");
   }
-
   return data.access_token;
 }
 
@@ -36,10 +34,8 @@ async function listFolderAll(token, path) {
   const entries = [];
   let has_more = true;
   let cursor = null;
-
-  // initial request
-  let body = { path, recursive: false, include_media_info: false, include_deleted: false, include_has_explicit_shared_members: false };
   let url = DROPBOX_LIST_FOLDER;
+  let body = { path, recursive: false, include_media_info: false, include_deleted: false };
 
   while (has_more) {
     const res = await fetch(url, {
@@ -60,8 +56,11 @@ async function listFolderAll(token, path) {
       body = { cursor };
     }
   }
-
   return entries;
+}
+
+function isAudioFile(name) {
+  return /\.(mp3|wav|ogg|m4a|flac)$/i.test(name);
 }
 
 async function createSharedLinkForPath(token, path_lower) {
@@ -75,22 +74,15 @@ async function createSharedLinkForPath(token, path_lower) {
       body: JSON.stringify({ path: path_lower }),
     });
     const data = await res.json();
-
     if (data.url) return data.url;
-    // if shared link already exists Dropbox returns error with metadata in nested object
     if (data.error && data.error[".tag"] === "shared_link_already_exists" && data.error.shared_link_already_exists?.metadata?.url) {
       return data.error.shared_link_already_exists.metadata.url;
     }
-    console.warn("No shared link data for", path_lower, data);
     return null;
   } catch (e) {
     console.error("createSharedLinkForPath error:", e);
     return null;
   }
-}
-
-function isAudioFile(name) {
-  return /\.(mp3|wav|ogg|m4a|flac)$/i.test(name);
 }
 
 export default async function handler(req, res) {
@@ -102,49 +94,72 @@ export default async function handler(req, res) {
 
   try {
     const token = await getAccessToken();
-    // path provided via query ?path=/owlbear/sub or in body
     const pathQuery = req.query.path || (req.body && req.body.path) || "/owlbear";
-    // Dropbox expects empty string or "/"? We'll pass as given.
     const path = pathQuery === "/" ? "" : pathQuery;
 
     const entries = await listFolderAll(token, path);
 
-    // Map entries to lightweight objects, for folders no url, for files create link
-    const mapped = await Promise.all(
-      entries.map(async (entry) => {
-        if (entry[".tag"] === "folder") {
-          return {
-            type: "folder",
-            name: entry.name,
-            path_lower: entry.path_lower,
-          };
-        }
-        if (entry[".tag"] === "file") {
-          if (!isAudioFile(entry.name)) {
-            // ignore non-audio files
-            return null;
-          }
-          const link = await createSharedLinkForPath(token, entry.path_lower);
-          const url = link ? link.replace(/\?dl=0$/, "?raw=1") : null;
-          return {
-            type: "file",
-            name: entry.name,
-            path_lower: entry.path_lower,
-            url,
-          };
-        }
-        return null;
-      })
-    );
+    // First map folders and files; folders will get count later
+    const basic = entries.map((entry) => {
+      if (entry[".tag"] === "folder") {
+        return {
+          type: "folder",
+          name: entry.name,
+          path_lower: entry.path_lower,
+        };
+      }
+      if (entry[".tag"] === "file") {
+        if (!isAudioFile(entry.name)) return null;
+        return {
+          type: "file",
+          name: entry.name,
+          path_lower: entry.path_lower,
+        };
+      }
+      return null;
+    }).filter(Boolean);
 
-    // Filter nulls and sort: folders first (alphabetical), then files (alphabetical)
-    const filtered = mapped.filter(Boolean);
-    filtered.sort((a, b) => {
-      if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
-      return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+    // For files create shared links in parallel
+    const files = basic.filter(e => e.type === "file");
+    const filesWithLinks = await Promise.all(files.map(async (f) => {
+      const link = await createSharedLinkForPath(token, f.path_lower);
+      return {
+        ...f,
+        url: link ? link.replace(/\?dl=0$/, "?raw=1") : null,
+      };
+    }));
+
+    // For folders: count audio files inside each folder.
+    // Use Promise.allSettled so a single folder failure doesn't break everything.
+    const folders = basic.filter(e => e.type === "folder");
+    const folderCountsPromises = folders.map(async (folder) => {
+      try {
+        const subEntries = await listFolderAll(token, folder.path_lower);
+        const audioCount = subEntries.filter(se => se[".tag"] === "file" && isAudioFile(se.name)).length;
+        return { ...folder, count: audioCount };
+      } catch (e) {
+        console.warn("Erreur comptage dossier", folder.path_lower, e);
+        return { ...folder, count: 0 };
+      }
     });
 
-    res.status(200).json({ path: path || "/", entries: filtered });
+    const folderCountsSettled = await Promise.allSettled(folderCountsPromises);
+    const foldersWithCounts = folderCountsSettled.map((r, i) => {
+      if (r.status === "fulfilled") return r.value;
+      // fallback
+      return { ...folders[i], count: 0 };
+    });
+
+    // Combine: folders first (with counts) then files with urls
+    const combined = [
+      ...foldersWithCounts.sort((a,b) => a.name.localeCompare(b.name, undefined, {sensitivity:'base'})),
+      ...filesWithLinks.sort((a,b) => a.name.localeCompare(b.name, undefined, {sensitivity:'base'})),
+    ];
+
+    // Ensure files include url (filter out files without url)
+    const final = combined.filter(item => item.type !== "file" || !!item.url);
+
+    res.status(200).json({ path: path || "/", entries: final });
   } catch (err) {
     console.error("❌ Dropbox API error:", err);
     res.status(500).json({ error: "Erreur Dropbox", details: String(err) });

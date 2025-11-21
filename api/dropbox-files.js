@@ -1,4 +1,4 @@
-// dropbox-files.js (Node / Vercel / Next API handler style)
+// dropbox-files.js
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -37,7 +37,6 @@ async function listFolderAll(token, path) {
   let has_more = true;
   let cursor = null;
 
-  // initial request
   let body = { path, recursive: false, include_media_info: false, include_deleted: false, include_has_explicit_shared_members: false };
   let url = DROPBOX_LIST_FOLDER;
 
@@ -93,6 +92,26 @@ function isAudioFile(name) {
   return /\.(mp3|wav|ogg|m4a|flac)$/i.test(name);
 }
 
+/**
+ * Quick transform for Dropbox share links -> direct raw file host
+ * - remove query string
+ * - replace www.dropbox.com with dl.dropboxusercontent.com
+ *
+ * Note: this works for most shared links. If you have special /scl/fi/... links that don't map,
+ * consider the proxy approach described earlier.
+ */
+function toDropboxDirect(link) {
+  if (!link) return null;
+  try {
+    const base = link.split("?")[0];
+    // replace host for direct file delivery
+    return base.replace("www.dropbox.com", "dl.dropboxusercontent.com");
+  } catch (e) {
+    console.warn("toDropboxDirect failed for", link, e);
+    return link;
+  }
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -102,14 +121,11 @@ export default async function handler(req, res) {
 
   try {
     const token = await getAccessToken();
-    // path provided via query ?path=/owlbear/sub or in body
     const pathQuery = req.query.path || (req.body && req.body.path) || "/owlbear";
-    // Dropbox expects empty string or "/"? We'll pass as given.
     const path = pathQuery === "/" ? "" : pathQuery;
 
     const entries = await listFolderAll(token, path);
 
-    // Map entries to lightweight objects, for folders no url, for files create link
     const mapped = await Promise.all(
       entries.map(async (entry) => {
         if (entry[".tag"] === "folder") {
@@ -121,11 +137,10 @@ export default async function handler(req, res) {
         }
         if (entry[".tag"] === "file") {
           if (!isAudioFile(entry.name)) {
-            // ignore non-audio files
             return null;
           }
           const link = await createSharedLinkForPath(token, entry.path_lower);
-          const url = link ? link.replace(/\?dl=0$/, "?raw=1") : null;
+          const url = link ? toDropboxDirect(link) : null;
           return {
             type: "file",
             name: entry.name,
@@ -137,7 +152,6 @@ export default async function handler(req, res) {
       })
     );
 
-    // Filter nulls and sort: folders first (alphabetical), then files (alphabetical)
     const filtered = mapped.filter(Boolean);
     filtered.sort((a, b) => {
       if (a.type !== b.type) return a.type === "folder" ? -1 : 1;

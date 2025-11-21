@@ -1,4 +1,4 @@
-// dropbox-files.js
+// dropbox-files.js (optimisé : concurrency limit + cache TTL)
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -7,6 +7,18 @@ const DROPBOX_TOKEN_URL = `${DROPBOX_API}/oauth2/token`;
 const DROPBOX_LIST_FOLDER = `${DROPBOX_API}/2/files/list_folder`;
 const DROPBOX_LIST_FOLDER_CONTINUE = `${DROPBOX_API}/2/files/list_folder/continue`;
 const DROPBOX_CREATE_LINK = `${DROPBOX_API}/2/sharing/create_shared_link_with_settings`;
+
+/**
+ * Config via env
+ * DROPBOX_CONCURRENCY: number of parallel workers for expensive ops (default 6)
+ * COUNT_CACHE_TTL_SECONDS: TTL for folder count cache in seconds (default 300)
+ */
+const CONCURRENCY = parseInt(process.env.DROPBOX_CONCURRENCY || "6", 10);
+const COUNT_CACHE_TTL_SECONDS = parseInt(process.env.COUNT_CACHE_TTL_SECONDS || "300", 10);
+
+// Simple in-memory cache for folder counts: { key -> { value, expiresAt } }
+// Note: in serverless this persists only while instance is warm — still very useful.
+const countCache = new Map();
 
 async function getAccessToken() {
   const credentials = Buffer.from(`${process.env.DROPBOX_APP_KEY}:${process.env.DROPBOX_APP_SECRET}`).toString("base64");
@@ -30,6 +42,13 @@ async function getAccessToken() {
   return data.access_token;
 }
 
+function isAudioFile(name) {
+  return /\.(mp3|wav|ogg|m4a|flac)$/i.test(name);
+}
+
+/**
+ * List a folder fully (handles has_more / continue)
+ */
 async function listFolderAll(token, path) {
   const entries = [];
   let has_more = true;
@@ -59,10 +78,9 @@ async function listFolderAll(token, path) {
   return entries;
 }
 
-function isAudioFile(name) {
-  return /\.(mp3|wav|ogg|m4a|flac)$/i.test(name);
-}
-
+/**
+ * Create or retrieve a shared link for a path.
+ */
 async function createSharedLinkForPath(token, path_lower) {
   try {
     const res = await fetch(DROPBOX_CREATE_LINK, {
@@ -78,10 +96,66 @@ async function createSharedLinkForPath(token, path_lower) {
     if (data.error && data.error[".tag"] === "shared_link_already_exists" && data.error.shared_link_already_exists?.metadata?.url) {
       return data.error.shared_link_already_exists.metadata.url;
     }
+    console.warn("No shared link data for", path_lower, data);
     return null;
   } catch (e) {
     console.error("createSharedLinkForPath error:", e);
     return null;
+  }
+}
+
+/**
+ * Concurrency-limited mapper
+ * items: array
+ * limit: number of workers
+ * fn: async function(item) => result
+ */
+async function limitedMap(items, limit, fn) {
+  const results = new Array(items.length);
+  let i = 0;
+
+  async function worker() {
+    while (true) {
+      const index = i++;
+      if (index >= items.length) return;
+      try {
+        const r = await fn(items[index], index);
+        results[index] = r;
+      } catch (e) {
+        // propagate as rejection to caller by storing the error object; caller can use Promise.allSettled equivalently
+        results[index] = { __error: e && String(e) };
+      }
+    }
+  }
+
+  const workers = [];
+  const n = Math.max(1, Math.min(limit, items.length));
+  for (let w = 0; w < n; w++) workers.push(worker());
+  await Promise.all(workers);
+  return results;
+}
+
+/**
+ * Get cached count for folder if fresh; otherwise compute and cache.
+ */
+async function getFolderAudioCountCached(token, folderPath) {
+  const key = `count:${folderPath}`;
+  const now = Date.now();
+  const cached = countCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    return cached.value;
+  }
+
+  // compute count
+  try {
+    const subEntries = await listFolderAll(token, folderPath);
+    const audioCount = subEntries.filter(se => se[".tag"] === "file" && isAudioFile(se.name)).length;
+    countCache.set(key, { value: audioCount, expiresAt: now + COUNT_CACHE_TTL_SECONDS * 1000 });
+    return audioCount;
+  } catch (e) {
+    console.warn("Erreur comptage dossier (cached) for", folderPath, e);
+    // don't cache failures aggressively; return 0 as fallback
+    return 0;
   }
 }
 
@@ -97,9 +171,10 @@ export default async function handler(req, res) {
     const pathQuery = req.query.path || (req.body && req.body.path) || "/owlbear";
     const path = pathQuery === "/" ? "" : pathQuery;
 
+    // list current folder
     const entries = await listFolderAll(token, path);
 
-    // First map folders and files; folders will get count later
+    // map basic structure
     const basic = entries.map((entry) => {
       if (entry[".tag"] === "folder") {
         return {
@@ -119,47 +194,53 @@ export default async function handler(req, res) {
       return null;
     }).filter(Boolean);
 
-    // For files create shared links in parallel
+    // split
+    const folders = basic.filter(e => e.type === "folder");
     const files = basic.filter(e => e.type === "file");
-    const filesWithLinks = await Promise.all(files.map(async (f) => {
+
+    // 1) create shared links for files with concurrency limit
+    const fileLinkResults = await limitedMap(files, CONCURRENCY, async (f) => {
       const link = await createSharedLinkForPath(token, f.path_lower);
       return {
         ...f,
         url: link ? link.replace(/\?dl=0$/, "?raw=1") : null,
       };
-    }));
+    });
 
-    // For folders: count audio files inside each folder.
-    // Use Promise.allSettled so a single folder failure doesn't break everything.
-    const folders = basic.filter(e => e.type === "folder");
-    const folderCountsPromises = folders.map(async (folder) => {
-      try {
-        const subEntries = await listFolderAll(token, folder.path_lower);
-        const audioCount = subEntries.filter(se => se[".tag"] === "file" && isAudioFile(se.name)).length;
-        return { ...folder, count: audioCount };
-      } catch (e) {
-        console.warn("Erreur comptage dossier", folder.path_lower, e);
-        return { ...folder, count: 0 };
+    // filter files that got url
+    const filesWithLinks = fileLinkResults
+      .map((r, idx) => {
+        // if r is {__error:...} treat as url=null
+        if (r && r.__error) {
+          console.warn("Erreur création lien fichier:", files[idx].path_lower, r.__error);
+          return { ...files[idx], url: null };
+        }
+        return r;
+      })
+      .filter(f => !!f.url);
+
+    // 2) compute folder counts with concurrency limit and caching
+    const folderCountResults = await limitedMap(folders, CONCURRENCY, async (folder) => {
+      // try cached value first
+      const count = await getFolderAudioCountCached(token, folder.path_lower);
+      return { ...folder, count };
+    });
+
+    const foldersWithCounts = folderCountResults.map((r, idx) => {
+      if (r && r.__error) {
+        console.warn("Erreur comptage dossier:", folders[idx].path_lower, r.__error);
+        return { ...folders[idx], count: 0 };
       }
+      return r;
     });
 
-    const folderCountsSettled = await Promise.allSettled(folderCountsPromises);
-    const foldersWithCounts = folderCountsSettled.map((r, i) => {
-      if (r.status === "fulfilled") return r.value;
-      // fallback
-      return { ...folders[i], count: 0 };
-    });
-
-    // Combine: folders first (with counts) then files with urls
+    // combine: folders first then files
     const combined = [
-      ...foldersWithCounts.sort((a,b) => a.name.localeCompare(b.name, undefined, {sensitivity:'base'})),
-      ...filesWithLinks.sort((a,b) => a.name.localeCompare(b.name, undefined, {sensitivity:'base'})),
+      ...foldersWithCounts.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })),
+      ...filesWithLinks.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })),
     ];
 
-    // Ensure files include url (filter out files without url)
-    const final = combined.filter(item => item.type !== "file" || !!item.url);
-
-    res.status(200).json({ path: path || "/", entries: final });
+    res.status(200).json({ path: path || "/", entries: combined });
   } catch (err) {
     console.error("❌ Dropbox API error:", err);
     res.status(500).json({ error: "Erreur Dropbox", details: String(err) });

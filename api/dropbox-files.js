@@ -7,7 +7,6 @@ const DROPBOX_LIST_FOLDER = `${DROPBOX_API}/2/files/list_folder`
 const DROPBOX_CREATE_LINK = `${DROPBOX_API}/2/sharing/create_shared_link_with_settings`
 
 async function getAccessToken() {
-  // ... (Pas de changement ici)
   const credentials = Buffer.from(`${process.env.DROPBOX_APP_KEY}:${process.env.DROPBOX_APP_SECRET}`).toString("base64")
   const response = await fetch(DROPBOX_TOKEN_URL, {
     method: "POST",
@@ -58,11 +57,11 @@ export default async function handler(req, res) {
     const isAudio = (file) => file[".tag"] === "file" && (file.name.endsWith(".mp3") || file.name.endsWith(".wav"))
     const isFolder = (file) => file[".tag"] === "folder"
 
-    // 1. Traitement des dossiers (plus besoin de lien public)
+    // 1. Traitement des dossiers
     const folders = listData.entries.filter(isFolder).map(folder => ({
       name: folder.name,
       path: folder.path_lower,
-      isFolder: true, // Nouveau flag pour l'identification
+      isFolder: true, // Nouveau flag
     }))
 
     // 2. Traitement des fichiers audio (avec création du lien public)
@@ -70,7 +69,6 @@ export default async function handler(req, res) {
       listData.entries.filter(isAudio).map(async (file) => {
         try {
           const linkRes = await fetch(DROPBOX_CREATE_LINK, {
-            // ... (Pas de changement ici)
             method: "POST",
             headers: {
               Authorization: `Bearer ${token}`,
